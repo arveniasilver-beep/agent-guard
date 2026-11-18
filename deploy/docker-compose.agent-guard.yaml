@@ -1,0 +1,231 @@
+# agent-guard'i DeerFlow gateway konteynerine baglar.
+#
+# Kullanim:
+#   AGENT_GUARD_SRC=/mutlak/yol/agent-guard \
+#   DEER_FLOW_EXTRA_COMPOSE=/mutlak/yol/agent-guard/deploy/docker-compose.agent-guard.yaml \
+#     ./scripts/docker.sh start
+#
+# NEDEN BOYLE:
+#   1) PYTHONPATH ile baglamak ISE YARAMAZ. docker/dev-entrypoint.sh sunucuyu
+#      "PYTHONPATH=. exec uv run ..." ile baslatir ve compose'da verilen degeri ezer.
+#   2) backend/pyproject.toml'a yerel yol bagimliligi eklemek IMAJ DERLEMESINI BOZAR:
+#      derleme sirasinda kaynak dizin build context'inde yoktur, "uv sync --locked"
+#      cozemez ve derleme basarisiz olur.
+#   3) Kalan yol: venv'in site-packages dizinine bir .pth dosyasi birakmak.
+#      "uv sync --locked --all-packages" bu dosyayi SILMEZ (olcerek dogrulandi),
+#      cunku uv yalnizca kendi kurdugu dagitmlari yonetir.
+services:
+  gateway:
+    volumes:
+      - type: bind
+        source: ${AGENT_GUARD_SRC:?AGENT_GUARD_SRC tanimlanmali}
+        target: /agent-guard
+        read_only: true
+      # Playwright tarayici ikilileri. Konteyner dosya sistemine kurulursa
+      # her yeniden olusturmada kaybolur ve ~150MB yeniden indirilir.
+      - playwright-cache:/root/.cache/ms-playwright
+      # Depo koku araclari. Backend testlerinin 10 tanesi ya /app/scripts
+      # altindaki betikleri okuyor ya da depo kokunu ".git" isaretinden
+      # buluyor. Ikisi de bagli olmadigi icin bu testler TOPLAMA asamasinda
+      # patliyordu -- yani hic calismadan hata veriyor ve gercek bir
+      # gerilemeden ayirt edilemiyorlardi.
+      - type: bind
+        source: ../scripts
+        target: /app/scripts
+        read_only: true
+      - type: bind
+        source: ../.git
+        target: /app/.git
+        read_only: true
+      # contracts/ ve docker/ da depo kokunde. Bunlar bagli olmadigi icin
+      # ~40 backend testi "FileNotFoundError: /app/contracts/..." ile
+      # kaliyordu; gercek bir gerilemeyle karistirilmasinlar diye baglaniyor.
+      - type: bind
+        source: ../contracts
+        target: /app/contracts
+        read_only: true
+      - type: bind
+        source: ../docker
+        target: /app/docker
+        read_only: true
+      # Ornek yapilandirmalar da depo kokunde; birkac test bunlari okuyor.
+      - type: bind
+        source: ../config.example.yaml
+        target: /app/config.example.yaml
+        read_only: true
+      - type: bind
+        source: ../extensions_config.example.json
+        target: /app/extensions_config.example.json
+        read_only: true
+      # Makefile ve .dockerignore: depo duzenini denetleyen testler bunlari
+      # /app altinda ariyor (.git bagli oldugu icin depo koku /app sayiliyor).
+      # Yalnizca bu ikisi 27 basarisizligi aciklıyor.
+      - type: bind
+        source: ../Makefile
+        target: /app/Makefile
+        read_only: true
+      - type: bind
+        source: ../.dockerignore
+        target: /app/.dockerignore
+        read_only: true
+    environment:
+      # manual | auto | off  (gecersiz deger guvenli tarafa, manual'a duser)
+      - AGENT_GUARD_MODE=${AGENT_GUARD_MODE:-auto}
+      # Yargic modeli. Ucuz ve hizli bir model yeterli: is tek kelimelik
+      # bir siniflandirma. Bos birakilirsa varsayilan model kullanilir.
+      - AGENT_GUARD_JUDGE_MODEL=${AGENT_GUARD_JUDGE_MODEL:-claude-haiku-4-5}
+      # Opsiyonel operator politikasi. YALNIZCA sistem promptuna eklenir.
+      - AGENT_GUARD_POLICY=${AGENT_GUARD_POLICY:-}
+      # Tarayici modu secenegi.
+      #   bos            -> izole headless Chromium (SSRF korumasi aktif)
+      #   http://host... -> kullanicinin kendi Chrome'u (koruma devre disi)
+      # DIKKAT: config.yaml'daki $NATLORA_BROWSER_CDP_URL ikamesi degisken
+      # TANIMSIZ oldugunda hata firlatir; bu yuzden bos da olsa hep tanimli olmali.
+      - NATLORA_BROWSER_CDP_URL=${NATLORA_BROWSER_CDP_URL:-}
+      # Gorsel ve video uretimi bu anahtarlari ORTAM DEGISKENINDEN okur
+      # (skills/public/{image,video}-generation). Anahtar .env icinde tanimli
+      # olsa bile upstream compose onu gateway konteynerine GECIRMIYORDU, yani
+      # kullanici anahtari girse de uretim calismiyor ve sebebi gorunmuyordu.
+      # Bos birakmak zararsiz: skill "anahtar yok" deyip duruyor.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
+      # Ikisi de tanimliysa hangisinin kullanilacagini secer (gemini|minimax).
+      - IMAGE_GENERATION_PROVIDER=${IMAGE_GENERATION_PROVIDER:-}
+      # Ajanin kendini tanitirken kullandigi ad (deerflow/branding.py).
+      - NATLORA_BRAND_NAME=${NATLORA_BRAND_NAME:-NATLORA}
+    # Entrypoint'e devretmeden once .pth dosyasini yaz. Dosya kalicidir
+    # (venv adlandirilmis bir Docker volume'unde yasar), bu yuzden her
+    # aciliste yeniden yazilmasi zararsizdir.
+    command:
+      - sh
+      - -c
+      - |
+        SP="$$(ls -d /app/backend/.venv/lib/python*/site-packages 2>/dev/null | head -1)"
+        [ -z "$$SP" ] && SP=/app/backend/.venv/lib/python3.12/site-packages
+        mkdir -p "$$SP" 2>/dev/null || true
+        printf '%s\n' /agent-guard > "$$SP/zz-agent-guard.pth" 2>/dev/null \
+          && echo "[agent-guard] sys.path girisi yazildi: $$SP/zz-agent-guard.pth" \
+          || echo "[agent-guard] UYARI: .pth yazilamadi" >&2
+
+        # Playwright'in sistem kutuphaneleri (libglib, libnss, libatk...)
+        # konteynerin DOSYA SISTEMINDE yasar, volume'de degil. Konteyner her
+        # yeniden yaratildiginda kayboluyorlar ve Chromium soyle cokuyor:
+        #   "libglib-2.0.so.0: cannot open shared object file"
+        # Tarayici ikilisi playwright-cache volume'unde kalici oldugu icin
+        # yalnizca kutuphaneler eksik kaliyor. Varsa atla, yoksa kur.
+        if ldconfig -p 2>/dev/null | grep -q libglib-2.0.so.0; then
+          echo "[natlora] tarayici sistem kutuphaneleri mevcut"
+        else
+          echo "[natlora] tarayici sistem kutuphaneleri eksik, kuruluyor (1-2 dk)..."
+          if (cd /app/backend && uv run --no-sync playwright install-deps chromium > /tmp/pw-deps.log 2>&1); then
+            echo "[natlora] tarayici kutuphaneleri hazir"
+          else
+            echo "[natlora] UYARI: kutuphane kurulumu basarisiz - bkz /tmp/pw-deps.log" >&2
+          fi
+        fi
+
+        # Gorsel/video uretimi skill'inin python bagimliliklari.
+        #
+        # NEDEN: skills/public/image-generation/scripts/generate.py "requests"
+        # ve (opsiyonel) "Pillow" import ediyor. Bu paketler YALNIZCA backend
+        # venv'inde kurulu; SKILL.md ise ajana duz "python ..." demesini
+        # soyluyor ve o da sistem python3'une dusuyor. Sistem python3'unde
+        # yalnizca pip var, dolayisiyla API anahtari tanimlansa bile betik
+        # ModuleNotFoundError ile patlardi -- kullanici anahtarin yanlis
+        # oldugunu sanardi. Sahte anahtarla olculdu: venv python ile betik ta
+        # Google API'sine gidip 400 aliyor (yani hazir), sistem python ile
+        # import asamasinda oluyor.
+        if python3 -c "import requests" >/dev/null 2>&1; then
+          echo "[natlora] gorsel uretim bagimliliklari mevcut"
+        else
+          echo "[natlora] gorsel uretim bagimliliklari kuruluyor..."
+          python3 -m pip install --quiet --no-input --break-system-packages requests Pillow > /tmp/pip-image.log 2>&1 \
+            || python3 -m pip install --quiet --no-input requests Pillow > /tmp/pip-image.log 2>&1 \
+            || echo "[natlora] UYARI: kurulamadi - bkz /tmp/pip-image.log" >&2
+          python3 -c "import requests" >/dev/null 2>&1 \
+            && echo "[natlora] gorsel uretim bagimliliklari hazir" \
+            || echo "[natlora] UYARI: requests hala yok, gorsel uretimi calismaz" >&2
+        fi
+
+        # Tarayici HEADLESS OLMAYAN modda calisir (config.yaml -> headless: false).
+        # Sebep: headless Chromium'un kullanici ajani "HeadlessChrome" icerir ve
+        # Cloudflare gibi bot korumalari bunu gorup engeller. Olculdu:
+        #   headless=true  -> Trendyol bos sayfa dondu
+        #   headless=false -> gercek sayfa geldi
+        # Headed mod bir ekran gerektirir; konteynerde ekran olmadigi icin sanal
+        # ekran (Xvfb) sart. DISPLAY tanimsizken tarayici hic acilmiyor.
+        if ! command -v Xvfb >/dev/null 2>&1; then
+          echo "[natlora] sanal ekran (Xvfb) kuruluyor..."
+          apt-get install -y --no-install-recommends xvfb > /tmp/xvfb-install.log 2>&1 \
+            || echo "[natlora] UYARI: Xvfb kurulamadi - bkz /tmp/xvfb-install.log" >&2
+        fi
+        if command -v Xvfb >/dev/null 2>&1; then
+          # "docker restart" konteynerin dosya sistemini KORUR, bu yuzden onceki
+          # calismadan kalan /tmp/.X99-lock yeni Xvfb'yi reddeder:
+          #   (EE) Server is already active for display 99
+          # Xvfb olmeden once bunu temizleyemedigi icin her yeniden baslatmada
+          # tarayici "Missing X server" ile acilmaz hale geliyordu. Kilidin
+          # sahibi gercekten yasiyor mu diye /proc'a bakip bayatsa siliyoruz.
+          # NOT: kabuk degiskenleri $$ ile kacirilmali; tek $ kullanilirsa
+          # Compose onlari kendi degiskeni sanip bos string ile degistirir.
+          if [ -e /tmp/.X99-lock ]; then
+            xpid="$$(tr -dc '0-9' < /tmp/.X99-lock 2>/dev/null)"
+            if [ -z "$$xpid" ] || [ ! -d "/proc/$$xpid" ]; then
+              echo "[natlora] bayat X kilidi temizleniyor (pid=$${xpid:-yok})"
+              rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+            fi
+          fi
+
+          if [ ! -S /tmp/.X11-unix/X99 ]; then
+            Xvfb :99 -screen 0 1280x720x24 > /tmp/xvfb.log 2>&1 &
+            i=0
+            while [ ! -S /tmp/.X11-unix/X99 ] && [ "$$i" -lt 20 ]; do
+              sleep 0.5
+              i=$$((i + 1))
+            done
+          fi
+
+          # "basladi" demeden ONCE gercekten baslamis mi diye bak. Onceki surum
+          # sadece "Xvfb kurulu mu" diye bakip hazir yaziyordu; ekran cokse bile
+          # log temiz gorunuyor, hata ancak ajan tarayiciyi acmaya calisinca
+          # ortaya cikiyordu.
+          if [ -S /tmp/.X11-unix/X99 ]; then
+            export DISPLAY=:99
+            echo "[natlora] sanal ekran hazir (DISPLAY=:99)"
+          else
+            echo "[natlora] HATA: sanal ekran baslatilamadi, tarayici ACILMAYACAK:" >&2
+            tail -5 /tmp/xvfb.log >&2
+          fi
+        else
+          echo "[natlora] UYARI: sanal ekran yok, tarayici headless'a dusecek" >&2
+        fi
+
+        exec sh /usr/local/bin/dev-entrypoint.sh
+
+  # Frontend testleri konteynerde gorunsun.
+  #
+  # NEDEN: docker-compose-dev.yaml frontend'e yalnizca src/, public/ ve
+  # next.config.js bagliyor. tests/ bagli olmadigi icin konteynerde
+  # "pnpm test" host'ta yazilan testleri HIC gormuyor -- yeni test dosyasi
+  # yazip calistirdiginizda "No test files found" alirsiniz ve testin
+  # gectigini saniyorsunuz. Bunu upstream dosyaya degil buraya ekliyoruz ki
+  # DeerFlow guncellemeleri catismasiz birlesmeye devam etsin.
+  #
+  # Yol, projenin calisma dizinine (deer-flow/docker) gore cozulur.
+  frontend:
+    volumes:
+      - type: bind
+        source: ../frontend/tests
+        target: /app/frontend/tests
+        read_only: true
+      # contracts/ depo kokunde durur ve iki test onu /app/contracts altindan
+      # okur (slash-contract, subtask-result). Bagli olmadiginda ENOENT ile
+      # import asamasinda patliyorlar -- yani hic calismadan "kirmizi"
+      # gorunuyorlar ve gercek bir gerileme ile ayirt edilemiyorlar.
+      - type: bind
+        source: ../contracts
+        target: /app/contracts
+        read_only: true
+
+volumes:
+  playwright-cache:
